@@ -5,11 +5,14 @@
 #
 # The "Release button": saschca/wyldTV-releases -> Actions -> Release -> Run workflow.
 # - publish = true:  build, test, sign, then publish a GitHub Release (every TV updates within about a day).
-# - publish = false: dry run. Build, test and sign only; the APK and update.json become a run artifact kept 1 day.
+#                    Only the current main of saschca/wyldTV can be published.
+# - publish = false: dry run of any ref. Build, test and sign only; the APK and update.json become a run artifact
+#                    kept 1 day.
 #
 # Security rules for this public file: it runs only on workflow_dispatch (never on push, pull_request or fork events),
 # it contains no secrets and never prints them, every action is pinned to a full commit hash, and the signing secrets
 # are only in the build job, whose token can only read. Only the publish job can write, and it has no signing secrets.
+# Gradle never sees the signing key: it builds an unsigned APK, and a later step signs it with apksigner.
 
 name: Release
 
@@ -89,6 +92,58 @@ jobs:
           persist-credentials: false
           path: src
 
+      - name: Publish only the current main of saschca/wyldTV
+        # Must stay right after the checkout, before every build step: a real release is refused unless the
+        # checked-out commit is the head of main (reviewed and merged code). Dry runs may build any branch or commit.
+        working-directory: src
+        env:
+          PUBLISH: ${{ inputs.publish }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          COMMIT=$(git rev-parse HEAD)
+          # The full-history checkout also fetched every branch, so origin/main is the head of main right now.
+          MAIN=$(git rev-parse --verify --quiet 'refs/remotes/origin/main^{commit}' || true)
+          echo "Ref '$REF' is commit $COMMIT; main of $SOURCE_REPO is ${MAIN:-unknown}."
+          if [ "$PUBLISH" != false ]; then
+            if [ -z "$MAIN" ] || [ "$COMMIT" != "$MAIN" ]; then
+              echo "::error::Only the current main of $SOURCE_REPO can be published, and '$REF' ($COMMIT) is not it. Use the ref main, or untick Publish for a dry run."
+              exit 1
+            fi
+            echo "OK: publishing the current main."
+          elif [ "$COMMIT" != "$MAIN" ]; then
+            echo "::notice::Dry run of '$REF', which is not the current main. This build could not be published."
+          fi
+
+      - name: Validate the Gradle wrapper (official Gradle checksums)
+        # The check of Gradle's wrapper-validation action, done here because this repository allows only GitHub's own
+        # actions: gradle-wrapper.jar must be an official Gradle wrapper, and the Gradle download must be official.
+        working-directory: src
+        run: |
+          set -euo pipefail
+          PROPS=gradle/wrapper/gradle-wrapper.properties
+          DIST_URL=$(sed -n 's/^distributionUrl=//p' "$PROPS" | sed 's/\\:/:/g' | tr -d '[:space:]')
+          DIST_SUM=$(sed -n 's/^distributionSha256Sum=//p' "$PROPS" | tr -d '[:space:]')
+          if ! [[ "$DIST_URL" =~ ^https://services\.gradle\.org/distributions/gradle-[0-9A-Za-z.-]+-(bin|all)\.zip$ ]]; then
+            echo "::error::Unexpected Gradle distributionUrl: $DIST_URL"; exit 1
+          fi
+          OFFICIAL=$(curl -fsSL --retry 3 "$DIST_URL.sha256" | tr -d '[:space:]')
+          if [ -z "$DIST_SUM" ] || [ "$DIST_SUM" != "$OFFICIAL" ]; then
+            echo "::error::distributionSha256Sum is missing or is not the official checksum of $DIST_URL."; exit 1
+          fi
+          JAR_SUM=$(sha256sum gradle/wrapper/gradle-wrapper.jar | cut -d' ' -f1)
+          curl -fsSL --retry 3 https://services.gradle.org/versions/all \
+            | jq -r '.[] | select(.snapshot == false and .nightly == false and .wrapperChecksumUrl != null) | .wrapperChecksumUrl' \
+            > "$RUNNER_TEMP/wrapper-urls.txt"
+          # One line per official wrapper checksum. A failed download only makes the check stricter.
+          xargs -P 16 -I{} sh -c 'printf "%s\n" "$(curl -fsSL --retry 3 "$1")"' _ {} \
+            < "$RUNNER_TEMP/wrapper-urls.txt" > "$RUNNER_TEMP/wrapper-sums.txt" || true
+          echo "Compared with $(grep -c . "$RUNNER_TEMP/wrapper-sums.txt") official wrapper checksums."
+          if ! grep -qx "$JAR_SUM" "$RUNNER_TEMP/wrapper-sums.txt"; then
+            echo "::error::gradle/wrapper/gradle-wrapper.jar ($JAR_SUM) is not an official Gradle wrapper."; exit 1
+          fi
+          echo "Gradle wrapper OK ($JAR_SUM); distribution $DIST_URL has its official checksum."
+
       - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: temurin
@@ -112,6 +167,11 @@ jobs:
           URL="https://github.com/$GITHUB_REPOSITORY/releases/latest/download/update.json"
           STATUS=$(curl -sSL -o "$RUNNER_TEMP/latest.json" -w '%{http_code}' "$URL")
           if [ "$STATUS" = 404 ]; then
+            # A missing update.json means "nothing published yet" only if this repository has no release at all.
+            COUNT=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=1" --jq 'length')
+            if [ "$COUNT" != 0 ]; then
+              echo "::error::Releases exist, but the latest one serves no update.json (HTTP 404). Check the Releases page first."; exit 1
+            fi
             LATEST=0; echo "No release published yet."
           elif [ "$STATUS" = 200 ]; then
             LATEST=$(jq -er '.versionCode' "$RUNNER_TEMP/latest.json")
@@ -139,22 +199,36 @@ jobs:
           chmod +x gradlew
           ./gradlew --no-daemon testDebugUnitTest
 
-      - name: Build and sign the release APK
+      - name: Build the unsigned release APK (no signing secrets in this step)
+        working-directory: src
+        run: ./gradlew --no-daemon assembleRelease
+
+      - name: Sign the APK with apksigner (outside Gradle)
         working-directory: src
         env:
           KEYSTORE_BASE64: ${{ secrets.WYLDTV_KEYSTORE_BASE64 }}
-          WYLDTV_KEYSTORE_PASSWORD: ${{ secrets.WYLDTV_KEYSTORE_PASSWORD }}
-          WYLDTV_KEY_PASSWORD: ${{ secrets.WYLDTV_KEY_PASSWORD }}
+          KS_PASS: ${{ secrets.WYLDTV_KEYSTORE_PASSWORD }}
+          KEY_PASS: ${{ secrets.WYLDTV_KEY_PASSWORD }}
           # The alias is not secret. As a secret, GitHub would mask the word "wyldtv" in every log line.
-          WYLDTV_KEY_ALIAS: wyldtv
+          KEY_ALIAS: wyldtv
         run: |
           set -euo pipefail
           umask 077
-          export WYLDTV_KEYSTORE_FILE="$RUNNER_TEMP/wyldtv-release.jks"
-          trap 'rm -f "$WYLDTV_KEYSTORE_FILE"' EXIT
-          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$WYLDTV_KEYSTORE_FILE"
-          # No configuration cache, so the signing values are never written into Gradle's cache.
-          ./gradlew --no-daemon --no-configuration-cache assembleRelease
+          IN=app/build/outputs/apk/release/app-release-unsigned.apk
+          [ -f "$IN" ] || { echo "::error::Gradle built no unsigned release APK."; exit 1; }
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          ALIGNED="$RUNNER_TEMP/wyldtv-aligned.apk"
+          KS="$RUNNER_TEMP/wyldtv-release.jks"
+          trap 'rm -f "$KS" "$ALIGNED"' EXIT
+          # Gradle already aligns (native libraries on 16 KB pages); zipalign only if that ever stops being true.
+          if "$BT/zipalign" -c -P 16 4 "$IN"; then cp "$IN" "$ALIGNED"; else "$BT/zipalign" -f -P 16 4 "$IN" "$ALIGNED"; fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$KS"
+          # Passwords come from the environment (env:), never from the command line. v2 only, as Gradle signed
+          # before: minSdk 24 needs no v1 (JAR) signature.
+          mkdir -p "$RUNNER_TEMP/signed"
+          "$BT/apksigner" sign --ks "$KS" --ks-key-alias "$KEY_ALIAS" --ks-pass env:KS_PASS --key-pass env:KEY_PASS \
+            --v1-signing-enabled false --v2-signing-enabled true --v3-signing-enabled false --v4-signing-enabled false \
+            --out "$RUNNER_TEMP/signed/app-release.apk" "$ALIGNED"
 
       - name: Verify the APK (signature, certificate, package, version)
         id: apk
@@ -164,9 +238,10 @@ jobs:
           CODE: ${{ steps.meta.outputs.code }}
         run: |
           set -euo pipefail
-          APK=app/build/outputs/apk/release/app-release.apk
-          [ -f "$APK" ] || { echo "::error::No signed release APK (are the signing secrets set?)"; exit 1; }
+          APK="$RUNNER_TEMP/signed/app-release.apk"
+          [ -f "$APK" ] || { echo "::error::No signed release APK."; exit 1; }
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          "$BT/zipalign" -c -P 16 4 "$APK" || { echo "::error::The signed APK is not aligned."; exit 1; }
           "$BT/apksigner" verify --verbose --print-certs "$APK" > "$RUNNER_TEMP/certs.txt"
           grep -E '^Verified using|^Number of signers|certificate (DN|SHA-256)' "$RUNNER_TEMP/certs.txt"
           grep -q '^Verified using v2 scheme (APK Signature Scheme v2): true' "$RUNNER_TEMP/certs.txt"
