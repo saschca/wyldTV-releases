@@ -144,8 +144,9 @@ jobs:
         env:
           KEYSTORE_BASE64: ${{ secrets.WYLDTV_KEYSTORE_BASE64 }}
           WYLDTV_KEYSTORE_PASSWORD: ${{ secrets.WYLDTV_KEYSTORE_PASSWORD }}
-          WYLDTV_KEY_ALIAS: ${{ secrets.WYLDTV_KEY_ALIAS }}
           WYLDTV_KEY_PASSWORD: ${{ secrets.WYLDTV_KEY_PASSWORD }}
+          # The alias is not secret. As a secret, GitHub would mask the word "wyldtv" in every log line.
+          WYLDTV_KEY_ALIAS: wyldtv
         run: |
           set -euo pipefail
           umask 077
@@ -169,10 +170,13 @@ jobs:
           "$BT/apksigner" verify --verbose --print-certs "$APK" > "$RUNNER_TEMP/certs.txt"
           grep -E '^Verified using|^Number of signers|certificate (DN|SHA-256)' "$RUNNER_TEMP/certs.txt"
           grep -q '^Verified using v2 scheme (APK Signature Scheme v2): true' "$RUNNER_TEMP/certs.txt"
-          [ "$(grep -c '^Signer #[0-9]* certificate SHA-256 digest:' "$RUNNER_TEMP/certs.txt")" = 1 ] \
-            || { echo "::error::Expected exactly one signer."; exit 1; }
-          CERT=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/certs.txt")
-          [ "$CERT" = "$RELEASE_CERT_SHA256" ] || { echo "::error::Signed with an unexpected certificate ($CERT)."; exit 1; }
+          # apksigner prints the digest per signer and scheme ("Signer #1 certificate ..." or "V2 Signer: certificate ...").
+          CERTS=$(grep -oE 'certificate SHA-256 digest: [0-9a-f]{64}' "$RUNNER_TEMP/certs.txt" | awk '{print $NF}' | sort -u)
+          [ "$(printf '%s\n' "$CERTS" | grep -c .)" = 1 ] || { echo "::error::Expected exactly one signing certificate."; exit 1; }
+          if grep -q '^Number of signers:' "$RUNNER_TEMP/certs.txt"; then
+            grep -qx 'Number of signers: 1' "$RUNNER_TEMP/certs.txt" || { echo "::error::Expected exactly one signer."; exit 1; }
+          fi
+          [ "$CERTS" = "$RELEASE_CERT_SHA256" ] || { echo "::error::Signed with an unexpected certificate ($CERTS)."; exit 1; }
           "$BT/aapt2" dump badging "$APK" > "$RUNNER_TEMP/badging.txt"
           BADGING=$(sed -n '1p' "$RUNNER_TEMP/badging.txt"); echo "$BADGING"
           [ "$(echo "$BADGING" | sed -n "s/.*package: name='\([^']*\)'.*/\1/p")" = "$APP_ID" ] \
