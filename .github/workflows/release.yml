@@ -1,0 +1,313 @@
+# wyldTV Release workflow (Issue #2, docs/RELEASING.md).
+#
+# SOURCE OF TRUTH: saschca/wyldTV release/release.yml (reviewed there in a pull request).
+# It runs from saschca/wyldTV-releases/.github/workflows/release.yml, a plain copy. Change it in saschca/wyldTV first.
+#
+# The "Release button": saschca/wyldTV-releases -> Actions -> Release -> Run workflow.
+# - publish = true:  build, test, sign, then publish a GitHub Release (every TV updates within about a day).
+# - publish = false: dry run. Build, test and sign only; the APK and update.json become a run artifact kept 1 day.
+#
+# Security rules for this public file: it runs only on workflow_dispatch (never on push, pull_request or fork events),
+# it contains no secrets and never prints them, every action is pinned to a full commit hash, and the signing secrets
+# are only in the build job, whose token can only read. Only the publish job can write, and it has no signing secrets.
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "What to build from saschca/wyldTV: normally main (a branch name here only for a dry run)"
+        type: string
+        required: true
+        default: main
+      publish:
+        description: "Publish to every TV (untick for a dry run that only builds and signs)"
+        type: boolean
+        required: true
+        default: true
+      notes:
+        description: "What's new, one line (shown on the TVs)"
+        type: string
+        required: false
+        default: ""
+      announcement:
+        description: "Optional message every TV shows once, e.g. Maintenance tonight from 22:00 (empty = none)"
+        type: string
+        required: false
+        default: ""
+      announcement_until:
+        description: "Optional last day of the message, YYYY-MM-DD (empty = no end date)"
+        type: string
+        required: false
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: saschca/wyldTV
+  APP_ID: com.wyldtv.app
+  # SHA-256 fingerprint of the release signing certificate (public, not a secret). A build signed with any other key
+  # fails. Change it only together with a deliberate key change (docs/RELEASING.md).
+  RELEASE_CERT_SHA256: c33147209a9f2f7170b12b7df45a3f52d09a47739c3ca1ed184cbc67e1ae0b78
+
+jobs:
+  build:
+    name: Build, test and sign
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      name: ${{ steps.meta.outputs.name }}
+      code: ${{ steps.meta.outputs.code }}
+      commit: ${{ steps.meta.outputs.commit }}
+    steps:
+      - name: Only the repository owner may release
+        env:
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          if [ "$ACTOR" != "$OWNER" ] || [ "$TRIGGERING_ACTOR" != "$OWNER" ]; then
+            echo "::error::Only $OWNER may run the Release workflow."
+            exit 1
+          fi
+
+      - name: Check out saschca/wyldTV (read-only deploy key, full history for the versionCode)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.WYLDTV_SOURCE_DEPLOY_KEY }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: src
+
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Version and refusal checks
+        id: meta
+        working-directory: src
+        env:
+          PUBLISH: ${{ inputs.publish }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          CODE=$(git rev-list --count HEAD)
+          MAJOR=$(sed -n 's/^major=\s*//p' version.properties | tr -d '[:space:]')
+          MINOR=$(sed -n 's/^minor=\s*//p' version.properties | tr -d '[:space:]')
+          NAME="$MAJOR.$MINOR.$CODE"
+          COMMIT=$(git rev-parse HEAD)
+          echo "Building wyldTV $NAME (versionCode $CODE) from $SOURCE_REPO commit $COMMIT"
+          # The latest published update.json, at the same address the TVs read.
+          URL="https://github.com/$GITHUB_REPOSITORY/releases/latest/download/update.json"
+          STATUS=$(curl -sSL -o "$RUNNER_TEMP/latest.json" -w '%{http_code}' "$URL")
+          if [ "$STATUS" = 404 ]; then
+            LATEST=0; echo "No release published yet."
+          elif [ "$STATUS" = 200 ]; then
+            LATEST=$(jq -er '.versionCode' "$RUNNER_TEMP/latest.json")
+            echo "Latest published versionCode: $LATEST"
+          else
+            echo "::error::Could not read the latest update.json (HTTP $STATUS)."; exit 1
+          fi
+          REFUSE=""
+          if [ "$CODE" -le "$LATEST" ]; then
+            REFUSE="versionCode $CODE is not higher than the published $LATEST. TVs would refuse it (README \"Versioning\")."
+          elif gh release view "v$NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            REFUSE="A release v$NAME already exists."
+          fi
+          if [ -n "$REFUSE" ]; then
+            if [ "$PUBLISH" = true ]; then echo "::error::$REFUSE"; exit 1; fi
+            echo "::warning::Dry run only: a real release of this build would be refused: $REFUSE"
+          fi
+          {
+            echo "tag=v$NAME"; echo "name=$NAME"; echo "code=$CODE"; echo "commit=$COMMIT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Unit tests
+        working-directory: src
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon testDebugUnitTest
+
+      - name: Build and sign the release APK
+        working-directory: src
+        env:
+          KEYSTORE_BASE64: ${{ secrets.WYLDTV_KEYSTORE_BASE64 }}
+          WYLDTV_KEYSTORE_PASSWORD: ${{ secrets.WYLDTV_KEYSTORE_PASSWORD }}
+          WYLDTV_KEY_ALIAS: ${{ secrets.WYLDTV_KEY_ALIAS }}
+          WYLDTV_KEY_PASSWORD: ${{ secrets.WYLDTV_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          export WYLDTV_KEYSTORE_FILE="$RUNNER_TEMP/wyldtv-release.jks"
+          trap 'rm -f "$WYLDTV_KEYSTORE_FILE"' EXIT
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$WYLDTV_KEYSTORE_FILE"
+          # No configuration cache, so the signing values are never written into Gradle's cache.
+          ./gradlew --no-daemon --no-configuration-cache assembleRelease
+
+      - name: Verify the APK (signature, certificate, package, version)
+        id: apk
+        working-directory: src
+        env:
+          NAME: ${{ steps.meta.outputs.name }}
+          CODE: ${{ steps.meta.outputs.code }}
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/release/app-release.apk
+          [ -f "$APK" ] || { echo "::error::No signed release APK (are the signing secrets set?)"; exit 1; }
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          "$BT/apksigner" verify --verbose --print-certs "$APK" > "$RUNNER_TEMP/certs.txt"
+          grep -E '^Verified using|^Number of signers|certificate (DN|SHA-256)' "$RUNNER_TEMP/certs.txt"
+          grep -q '^Verified using v2 scheme (APK Signature Scheme v2): true' "$RUNNER_TEMP/certs.txt"
+          [ "$(grep -c '^Signer #[0-9]* certificate SHA-256 digest:' "$RUNNER_TEMP/certs.txt")" = 1 ] \
+            || { echo "::error::Expected exactly one signer."; exit 1; }
+          CERT=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/certs.txt")
+          [ "$CERT" = "$RELEASE_CERT_SHA256" ] || { echo "::error::Signed with an unexpected certificate ($CERT)."; exit 1; }
+          "$BT/aapt2" dump badging "$APK" > "$RUNNER_TEMP/badging.txt"
+          BADGING=$(sed -n '1p' "$RUNNER_TEMP/badging.txt"); echo "$BADGING"
+          [ "$(echo "$BADGING" | sed -n "s/.*package: name='\([^']*\)'.*/\1/p")" = "$APP_ID" ] \
+            || { echo "::error::Wrong application ID (expected $APP_ID)."; exit 1; }
+          [ "$(echo "$BADGING" | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p")" = "$CODE" ] \
+            || { echo "::error::APK versionCode differs from the commit count $CODE."; exit 1; }
+          [ "$(echo "$BADGING" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")" = "$NAME" ] \
+            || { echo "::error::APK versionName differs from $NAME."; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp "$APK" "$GITHUB_WORKSPACE/dist/wyldtv-$NAME.apk"
+
+      - name: Source archive (trimmed by .gitattributes export-ignore) and its check
+        working-directory: src
+        env:
+          NAME: ${{ steps.meta.outputs.name }}
+        run: |
+          set -euo pipefail
+          ARCHIVE="$GITHUB_WORKSPACE/dist/wyldtv-$NAME-source.tar.gz"
+          PREFIX="wyldtv-$NAME-source/"
+          git archive --format=tar.gz --prefix="$PREFIX" -o "$ARCHIVE" HEAD
+          tar -tzf "$ARCHIVE" | sed "s|^$PREFIX||" > "$RUNNER_TEMP/archive.txt"
+          echo "Top level of the source archive:"; grep -E '^[^/]+/?$' "$RUNNER_TEMP/archive.txt" | sort
+          # Never published: internal notes, agent instructions, local secrets and keys.
+          if grep -nE '^(docs/HANDOVER\.md|docs/agent/|\.claude/|AGENTS\.md$|CLAUDE\.md$)|(^|/)(secrets|local|keystore)\.properties$|\.(jks|keystore|p12)$' "$RUNNER_TEMP/archive.txt"; then
+            echo "::error::Forbidden path in the source archive (listed above)."; exit 1
+          fi
+          # Only build and licence files. A new top-level path must be classified on purpose (.gitattributes).
+          if grep -vE '^$|^(app|gradle|licenses)/|^(build\.gradle\.kts|settings\.gradle\.kts|gradle\.properties|gradlew|gradlew\.bat|version\.properties|LICENSE|THIRD_PARTY_NOTICES\.md|README\.md|secrets\.properties\.example|\.gitignore)$' "$RUNNER_TEMP/archive.txt"; then
+            echo "::error::Unexpected path in the source archive (listed above); add it to export-ignore or to this allow list."; exit 1
+          fi
+          for f in app/build.gradle.kts settings.gradle.kts build.gradle.kts gradlew gradle/wrapper/gradle-wrapper.properties version.properties LICENSE THIRD_PARTY_NOTICES.md README.md; do
+            grep -qx "$f" "$RUNNER_TEMP/archive.txt" || { echo "::error::$f is missing from the source archive."; exit 1; }
+          done
+          echo "Source archive OK: $(wc -l < "$RUNNER_TEMP/archive.txt") entries."
+
+      - name: Write update.json
+        env:
+          NAME: ${{ steps.meta.outputs.name }}
+          CODE: ${{ steps.meta.outputs.code }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          COMMIT: ${{ steps.meta.outputs.commit }}
+          REF: ${{ inputs.ref }}
+          PUBLISH: ${{ inputs.publish }}
+          NOTES: ${{ inputs.notes }}
+          ANN_TEXT: ${{ inputs.announcement }}
+          ANN_UNTIL: ${{ inputs.announcement_until }}
+        run: |
+          set -euo pipefail
+          APK_FILE="wyldtv-$NAME.apk"
+          APK_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$APK_FILE"
+          SHA=$(sha256sum "dist/$APK_FILE" | cut -d' ' -f1)
+          ANN_ID=""
+          if [ -n "$ANN_TEXT" ]; then
+            # The same text keeps the same id, so a TV never shows one message twice.
+            ANN_ID=$(printf '%s' "$ANN_TEXT" | sha256sum | cut -c1-12)
+          fi
+          if [ -n "$ANN_UNTIL" ]; then
+            if [ -z "$ANN_TEXT" ]; then echo "::error::announcement_until is set but the announcement is empty."; exit 1; fi
+            if ! [[ "$ANN_UNTIL" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || ! date -d "$ANN_UNTIL" >/dev/null 2>&1; then
+              echo "::error::announcement_until must be a date like 2026-12-31."; exit 1
+            fi
+          fi
+          jq -n --argjson code "$CODE" --arg name "$NAME" --arg notes "$NOTES" --arg apk "$APK_URL" --arg sha "$SHA" \
+                --arg aid "$ANN_ID" --arg atext "$ANN_TEXT" --arg auntil "$ANN_UNTIL" '
+            {versionCode: $code, versionName: $name, notes: $notes, apk: $apk, sha256: $sha}
+            + (if $atext == "" then {} else
+                {announcement: ({id: $aid, text: $atext} + (if $auntil == "" then {} else {until: $auntil} end))} end)
+          ' > dist/update.json
+          cat dist/update.json
+          jq -e '(.versionCode|type) == "number" and (.apk|startswith("https://")) and (.sha256|test("^[0-9a-f]{64}$"))' dist/update.json >/dev/null
+          {
+            echo "### wyldTV $NAME (versionCode $CODE)"
+            echo "Commit \`$COMMIT\` of $SOURCE_REPO, ref \`$REF\`, publish: $PUBLISH"
+            echo; echo '```json'; cat dist/update.json; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Dry run keeps only the APK and update.json
+        if: ${{ !inputs.publish }}
+        run: rm -f dist/*-source.tar.gz
+
+      - name: Hand the files to the publish job (in a dry run this is the result), kept 1 day
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wyldtv-${{ steps.meta.outputs.name }}${{ !inputs.publish && '-dry-run' || '' }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish the GitHub Release
+    needs: build
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wyldtv-${{ needs.build.outputs.name }}
+          path: dist
+
+      - name: Create the release (tag, latest) with APK, update.json and source archive
+        # wyldtv.apk is the same APK under a fixed name, so .../releases/latest/download/wyldtv.apk (README of this
+        # repository, Downloader) always gives the newest version for a first installation. update.json points to the
+        # versioned file.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+          NAME: ${{ needs.build.outputs.name }}
+          COMMIT: ${{ needs.build.outputs.commit }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          set -euo pipefail
+          ls -l dist
+          {
+            if [ -n "$NOTES" ]; then printf '%s\n\n' "$NOTES"; fi
+            echo "Install: \`wyldtv-$NAME.apk\`. TVs with wyldTV update themselves."
+            echo
+            echo "Source code (GPL-3.0): \`wyldtv-$NAME-source.tar.gz\`, commit \`$COMMIT\`."
+          } > "$RUNNER_TEMP/notes.md"
+          cp "dist/wyldtv-$NAME.apk" dist/wyldtv.apk
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "wyldTV $NAME" \
+            --notes-file "$RUNNER_TEMP/notes.md" --latest \
+            "dist/wyldtv-$NAME.apk" dist/wyldtv.apk dist/update.json "dist/wyldtv-$NAME-source.tar.gz"
+
+      - name: Check the address the TVs read
+        env:
+          NAME: ${{ needs.build.outputs.name }}
+        run: |
+          set -euo pipefail
+          URL="https://github.com/$GITHUB_REPOSITORY/releases/latest/download/update.json"
+          for i in 1 2 3 4 5 6; do
+            GOT=$(curl -fsSL "$URL" | jq -r '.versionName' || true)
+            [ "$GOT" = "$NAME" ] && { echo "$URL now serves $NAME."; exit 0; }
+            sleep 10
+          done
+          echo "::error::$URL does not serve $NAME yet (got '$GOT')."; exit 1
