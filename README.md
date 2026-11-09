@@ -72,7 +72,7 @@ wyldTV is free software under the **GNU General Public License version 3** (it i
 
 wyldTV stands on the work of many others. Thank you!
 
-**Based on IPVIO Stream** by Emrodev, an open-source IPTV player for Android TV (GPL-3.0). wyldTV is a modified version (2026) with its own name and logo, as the original asks.
+**Based on IPVIO Stream** by Emrodev, an open-source IPTV player for Android TV (GPL-3.0). wyldTV is an extensively reworked and extended version of IPVIO Stream (2026), with its own name and logo, as the original asks.
 
 **Libraries**
 
