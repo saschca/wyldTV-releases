@@ -372,6 +372,8 @@ jobs:
             echo "Install: \`wyldtv-$NAME.apk\`. TVs with wyldTV update themselves."
             echo
             echo "Source code (GPL-3.0): \`wyldtv-$NAME-source.tar.gz\`, commit \`$COMMIT\`."
+            echo
+            echo "About wyldTV, screenshots and credits: https://github.com/$GITHUB_REPOSITORY#readme"
           } > "$RUNNER_TEMP/notes.md"
           cp "dist/wyldtv-$NAME.apk" dist/wyldtv.apk
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "wyldTV $NAME" \
