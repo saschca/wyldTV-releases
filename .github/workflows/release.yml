@@ -201,6 +201,11 @@ jobs:
 
       - name: Build the unsigned release APK (no signing secrets in this step)
         working-directory: src
+        env:
+          # Google Drive sync client (saschca/wyldTV#234): built into the APK on purpose (Herr approval on the Issue).
+          # Only here in the read-only build job; never printed, and not part of the source archive or the notes.
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
         run: ./gradlew --no-daemon assembleRelease
 
       - name: Sign the APK with apksigner (outside Gradle)
